@@ -5,7 +5,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -42,7 +41,7 @@ if not BOT_TOKEN:
 ACCESS_FILE = BASE_DIR / "access.json"
 
 
-def load_allowed() -> set[int]:
+def load_allowed() -> set:
     allowed = {OWNER_ID}
     if ACCESS_FILE.exists():
         try:
@@ -53,7 +52,7 @@ def load_allowed() -> set[int]:
     return allowed
 
 
-def save_allowed(ids: set[int]) -> None:
+def save_allowed(ids: set) -> None:
     ACCESS_FILE.write_text(
         json.dumps({"allowed": sorted(ids - {OWNER_ID})}, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -61,47 +60,56 @@ def save_allowed(ids: set[int]) -> None:
 
 
 ALLOWED = load_allowed()
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 # ============================================================
-#                   1. ПАРСЕР СХЕМЫ (AST)
+#                  ТИПЫ ПЕРЕМЕННЫХ (маппинг)
 # ============================================================
+# Внутренние типы: INT, FLOAT, STR, BOOL
+PY_TYPES = {"INT": "int", "FLOAT": "float", "STR": "str", "BOOL": "bool"}
+CPP_TYPES = {"INT": "int", "FLOAT": "double", "STR": "string", "BOOL": "bool"}
+JAVA_TYPES = {"INT": "int", "FLOAT": "double", "STR": "String", "BOOL": "boolean"}
+VB_TYPES = {"INT": "Integer", "FLOAT": "Double", "STR": "String", "BOOL": "Boolean"}
+PY_INPUT = {"INT": "int", "FLOAT": "float", "STR": "str", "BOOL": "bool"}
 
-class ParseError(Exception):
-    def __init__(self, line: int, msg: str):
-        super().__init__(f"строка {line}: {msg}")
-        self.line = line
-        self.msg = msg
 
-
+# ============================================================
+#                       AST-УЗЛЫ
+# ============================================================
 @dataclass
-class Node:  # базовый узел AST
+class Node:
     pass
 
 
 @dataclass
+class VarDecl(Node):
+    names: list
+    vtype: str  # INT/FLOAT/STR/BOOL
+    size: int = 0  # 0 = не массив
+
+
+@dataclass
 class Input(Node):
-    names: list[str]
+    names: list
 
 
 @dataclass
 class Print(Node):
-    exprs: list[str]
+    exprs: list
 
 
 @dataclass
 class Assign(Node):
-    name: str
+    target: str  # "x" или "a[i]"
     expr: str
 
 
 @dataclass
 class If(Node):
     cond: str
-    then_body: list[Node] = field(default_factory=list)
-    else_body: list[Node] = field(default_factory=list)
+    then_body: list = field(default_factory=list)
+    else_body: list = field(default_factory=list)
 
 
 @dataclass
@@ -109,17 +117,45 @@ class For(Node):
     var: str
     start: str
     end: str
-    body: list[Node] = field(default_factory=list)
+    body: list = field(default_factory=list)
 
 
 @dataclass
 class While(Node):
     cond: str
-    body: list[Node] = field(default_factory=list)
+    body: list = field(default_factory=list)
 
 
-def split_top_level(s: str, sep: str = ",") -> list[str]:
-    """Разбивает строку по запятым, не трогая запятые внутри кавычек/скобок."""
+@dataclass
+class FuncDef(Node):
+    name: str
+    params: list  # [(name, type), ...]
+    ret_type: str  # INT/FLOAT/STR/BOOL/VOID
+    body: list = field(default_factory=list)
+
+
+@dataclass
+class Return(Node):
+    expr: str = ""
+
+
+@dataclass
+class CallStmt(Node):
+    """Вызов процедуры как отдельный оператор: MYPROC(x, y)"""
+    call_expr: str
+
+
+# ============================================================
+#                     ПАРСЕР СХЕМЫ
+# ============================================================
+class ParseError(Exception):
+    def __init__(self, line: int, msg: str):
+        super().__init__(f"строка {line}: {msg}")
+        self.line = line
+        self.msg = msg
+
+
+def split_top_level(s: str, sep: str = ","):
     parts, buf, depth, in_str = [], "", 0, False
     i = 0
     while i < len(s):
@@ -127,9 +163,9 @@ def split_top_level(s: str, sep: str = ",") -> list[str]:
         if ch == '"' and (i == 0 or s[i - 1] != "\\"):
             in_str = not in_str
         if not in_str:
-            if ch == "(":
+            if ch in "([":
                 depth += 1
-            elif ch == ")":
+            elif ch in ")]":
                 depth -= 1
             elif ch == sep and depth == 0:
                 parts.append(buf.strip())
@@ -143,20 +179,25 @@ def split_top_level(s: str, sep: str = ",") -> list[str]:
     return parts
 
 
-def parse_scheme(text: str) -> list[Node]:
-    lines = text.splitlines()
-
-    # токенизация: убираем BEGIN/END, комментарии, пустые строки
-    tokens: list[tuple[int, str]] = []
-    for i, raw in enumerate(lines, 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
+def parse_scheme(text: str):
+    raw_lines = text.splitlines()
+    tokens = []
+    for i, raw in enumerate(raw_lines, 1):
+        line = raw.rstrip()
+        # отрезаем комментарий (вне строк)
+        out, in_str = "", False
+        j = 0
+        while j < len(line):
+            ch = line[j]
+            if ch == '"' and (j == 0 or line[j - 1] != "\\"):
+                in_str = not in_str
+            if ch == "#" and not in_str:
+                break
+            out += ch
+            j += 1
+        line = out.strip()
+        if not line:
             continue
-        # комментарий в конце строки
-        if "#" in line:
-            line = line.split("#", 1)[0].strip()
-            if not line:
-                continue
         up = line.upper()
         if up in ("BEGIN", "END"):
             continue
@@ -164,10 +205,10 @@ def parse_scheme(text: str) -> list[Node]:
 
     pos = 0
 
-    def peek() -> tuple[int, str] | None:
+    def peek():
         return tokens[pos] if pos < len(tokens) else None
 
-    def next_tok() -> tuple[int, str]:
+    def next_tok():
         nonlocal pos
         if pos >= len(tokens):
             raise ParseError(tokens[-1][0] if tokens else 0, "неожиданный конец схемы")
@@ -175,14 +216,14 @@ def parse_scheme(text: str) -> list[Node]:
         pos += 1
         return t
 
-    def parse_block(stop_words: set[str]) -> list[Node]:
-        body: list[Node] = []
+    def parse_block(stop_words):
+        body = []
         while True:
             t = peek()
             if t is None:
                 if stop_words:
                     raise ParseError(tokens[-1][0] if tokens else 0,
-                                     f"ожидалось {stop_words}, но схема закончилась")
+                                     f"ожидалось {stop_words}, схема закончилась")
                 return body
             line_no, line = t
             up = line.upper()
@@ -190,14 +231,56 @@ def parse_scheme(text: str) -> list[Node]:
             if up in stop_words:
                 return body
 
+            # FUNCTION name(a: INT, b: INT): INT
+            m = re.match(
+                r"^FUNCTION\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*:\s*(\w+)$",
+                line, re.IGNORECASE,
+            )
+            if m:
+                next_tok()
+                name = m.group(1)
+                params_str = m.group(2).strip()
+                ret = m.group(3).upper()
+                params = []
+                if params_str:
+                    for p in split_top_level(params_str):
+                        pm = re.match(r"^([A-Za-z_]\w*)\s*:\s*(\w+)$", p)
+                        if not pm:
+                            raise ParseError(line_no, f"плохой параметр: {p!r}")
+                        params.append((pm.group(1), pm.group(2).upper()))
+                body_f = parse_block({"ENDFUNCTION"})
+                t2 = peek()
+                if not t2 or t2[1].upper() != "ENDFUNCTION":
+                    raise ParseError(line_no, "не найден ENDFUNCTION")
+                next_tok()
+                body.append(FuncDef(name, params, ret, body_f))
+                continue
+
+            # VAR x, y, z: INT   /  VAR a: ARRAY[10] OF INT
+            m = re.match(r"^VAR\s+(.+?)\s*:\s*(\w+)(?:\s*\[\s*(\d+)\s*\])?$",
+                         line, re.IGNORECASE)
+            if m and not re.match(r"^VAR\s+.+:\s*\w+\s*\[\s*\d+\s*\]\s+OF\s+", line, re.IGNORECASE):
+                next_tok()
+                names = [x.strip() for x in split_top_level(m.group(1)) if x.strip()]
+                vtype = m.group(2).upper()
+                if vtype not in PY_TYPES:
+                    raise ParseError(line_no, f"неизвестный тип: {vtype}")
+                body.append(VarDecl(names, vtype))
+                continue
+
+            # VAR a[10]: INT  — массив
+            m = re.match(r"^VAR\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*:\s*(\w+)$",
+                         line, re.IGNORECASE)
+            if m:
+                next_tok()
+                body.append(VarDecl([m.group(1)], m.group(3).upper(), int(m.group(2))))
+                continue
+
             # INPUT
             m = re.match(r"^INPUT\s+(.+)$", line, re.IGNORECASE)
             if m:
                 next_tok()
                 names = [n.strip() for n in split_top_level(m.group(1)) if n.strip()]
-                for n in names:
-                    if not re.fullmatch(r"[A-Za-z_]\w*", n):
-                        raise ParseError(line_no, f"некорректное имя переменной: {n}")
                 body.append(Input(names))
                 continue
 
@@ -205,8 +288,14 @@ def parse_scheme(text: str) -> list[Node]:
             m = re.match(r"^PRINT\s+(.+)$", line, re.IGNORECASE)
             if m:
                 next_tok()
-                exprs = [e for e in split_top_level(m.group(1)) if e]
-                body.append(Print(exprs))
+                body.append(Print([e for e in split_top_level(m.group(1)) if e]))
+                continue
+
+            # RETURN [expr]
+            m = re.match(r"^RETURN(?:\s+(.+))?$", line, re.IGNORECASE)
+            if m:
+                next_tok()
+                body.append(Return((m.group(1) or "").strip()))
                 continue
 
             # IF ... THEN
@@ -215,7 +304,7 @@ def parse_scheme(text: str) -> list[Node]:
                 next_tok()
                 cond = m.group(1).strip()
                 then_body = parse_block({"ELSE", "ENDIF"})
-                else_body: list[Node] = []
+                else_body = []
                 t2 = peek()
                 if t2 and t2[1].upper() == "ELSE":
                     next_tok()
@@ -232,33 +321,38 @@ def parse_scheme(text: str) -> list[Node]:
                          line, re.IGNORECASE)
             if m:
                 next_tok()
-                var, a, b = m.group(1), m.group(2).strip(), m.group(3).strip()
                 inner = parse_block({"ENDFOR"})
                 t2 = peek()
                 if not t2 or t2[1].upper() != "ENDFOR":
                     raise ParseError(line_no, "не найден ENDFOR")
                 next_tok()
-                body.append(For(var, a, b, inner))
+                body.append(For(m.group(1), m.group(2).strip(), m.group(3).strip(), inner))
                 continue
 
             # WHILE cond
             m = re.match(r"^WHILE\s+(.+)$", line, re.IGNORECASE)
             if m:
                 next_tok()
-                cond = m.group(1).strip()
                 inner = parse_block({"ENDWHILE"})
                 t2 = peek()
                 if not t2 or t2[1].upper() != "ENDWHILE":
                     raise ParseError(line_no, "не найден ENDWHILE")
                 next_tok()
-                body.append(While(cond, inner))
+                body.append(While(m.group(1).strip(), inner))
                 continue
 
-            # присваивание
-            m = re.match(r"^([A-Za-z_]\w*)\s*=\s*(.+)$", line)
+            # Присваивание: x = ...  / a[i] = ...
+            m = re.match(r"^([A-Za-z_]\w*(?:\s*\[[^\]]+\])?)\s*=\s*(.+)$", line)
+            if m and not line.upper().startswith(("IF ", "WHILE ", "FOR ", "VAR ", "FUNCTION ", "RETURN")):
+                next_tok()
+                body.append(Assign(m.group(1).replace(" ", ""), m.group(2).strip()))
+                continue
+
+            # Вызов функции/процедуры как оператор: MYPROC(x, y)
+            m = re.match(r"^([A-Za-z_]\w*)\s*\((.*)\)\s*$", line)
             if m:
                 next_tok()
-                body.append(Assign(m.group(1), m.group(2).strip()))
+                body.append(CallStmt(line))
                 continue
 
             raise ParseError(line_no, f"не понимаю команду: {line!r}")
@@ -270,21 +364,11 @@ def parse_scheme(text: str) -> list[Node]:
 
 
 # ============================================================
-#             2. ТРАНСФОРМАЦИЯ ВЫРАЖЕНИЙ ПОД ЯЗЫК
+#             ТРАНСЛЯЦИЯ ВЫРАЖЕНИЙ ПОД ЯЗЫК
 # ============================================================
-
 def translate_expr(expr: str, lang: str) -> str:
-    """
-    Приводит выражение к синтаксису целевого языка.
-    Логика:
-      - True/False
-      - != / ==  (одинаково)
-      - AND/OR/NOT -> &&/||/! (для C++/Java), And/Or/Not (VB), and/or/not (Python)
-      - строки "..." оставляем как есть
-    """
-    s = expr
-    # маскируем строки, чтобы не трогать их содержимое
-    strings: list[str] = []
+    s = expr.strip()
+    strings = []
 
     def mask(m):
         strings.append(m.group(0))
@@ -292,12 +376,15 @@ def translate_expr(expr: str, lang: str) -> str:
 
     s = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', mask, s)
 
-    # логические операторы по словам
+    # логические операторы
     s = re.sub(r"\bAND\b", "__AND__", s, flags=re.IGNORECASE)
     s = re.sub(r"\bOR\b", "__OR__", s, flags=re.IGNORECASE)
     s = re.sub(r"\bNOT\b", "__NOT__", s, flags=re.IGNORECASE)
     s = re.sub(r"\bTRUE\b", "__TRUE__", s, flags=re.IGNORECASE)
     s = re.sub(r"\bFALSE\b", "__FALSE__", s, flags=re.IGNORECASE)
+    # TRUE/FALSE как литералы
+    s = re.sub(r"\bMOD\b", "%", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bDIV\b", "//", s, flags=re.IGNORECASE) if lang == "python" else re.sub(r"\bDIV\b", "/", s, flags=re.IGNORECASE)
 
     if lang == "python":
         s = s.replace("__AND__", "and").replace("__OR__", "or").replace("__NOT__", "not")
@@ -305,12 +392,10 @@ def translate_expr(expr: str, lang: str) -> str:
     elif lang in ("cpp", "java"):
         s = s.replace("__AND__", "&&").replace("__OR__", "||").replace("__NOT__", "!")
         s = s.replace("__TRUE__", "true").replace("__FALSE__", "false")
-        # строки в C++/Java оставляем как есть
     elif lang == "vb":
         s = s.replace("__AND__", "And").replace("__OR__", "Or").replace("__NOT__", "Not")
         s = s.replace("__TRUE__", "True").replace("__FALSE__", "False")
 
-    # вернуть строки обратно
     def unmask(m):
         return strings[int(m.group(1))]
 
@@ -318,52 +403,112 @@ def translate_expr(expr: str, lang: str) -> str:
     return s
 
 
-def is_string_literal(expr: str) -> bool:
-    e = expr.strip()
+def is_string_literal(e: str) -> bool:
+    e = e.strip()
     return len(e) >= 2 and e[0] == '"' and e[-1] == '"'
 
 
 # ============================================================
-#                   3. ГЕНЕРАТОРЫ КОДА
+#                 ГЕНЕРАТОРЫ КОДА (4 языка)
 # ============================================================
-
-class CodeGenBase:
+class BaseGen:
     def __init__(self):
-        self.lines: list[str] = []
+        self.lines = []
         self.indent = 0
+        # таблица типов переменных: {name: "INT"}  — из VAR
+        self.vars = {}
+        # функции: {name: (params, ret_type)}
+        self.funcs = {}
 
-    def w(self, text: str = "") -> None:
+    def w(self, text=""):
         self.lines.append(("    " * self.indent) + text if text else "")
 
-    def gen(self, ast: list[Node]) -> str:
+    def collect(self, ast):
+        """Собирает переменные и функции из AST (рекурсивно)."""
         for n in ast:
-            self.node(n)
-        return "\n".join(self.lines)
+            if isinstance(n, VarDecl):
+                for name in n.names:
+                    self.vars[name] = n.vtype
+            elif isinstance(n, FuncDef):
+                self.funcs[n.name] = (n.params, n.ret_type)
+                self.collect(n.body)
+            elif isinstance(n, If):
+                self.collect(n.then_body)
+                self.collect(n.else_body)
+            elif isinstance(n, For):
+                self.vars.setdefault(n.var, "INT")
+                self.collect(n.body)
+            elif isinstance(n, While):
+                self.collect(n.body)
 
-    def node(self, n: Node) -> None:
+    def type_of(self, name):
+        return self.vars.get(name, "INT")  # по умолчанию int
+
+    def gen(self, ast):
+        self.collect(ast)
+        return self._render(ast)
+
+    def _render(self, ast):
+        raise NotImplementedError
+
+    def node(self, n):
         raise NotImplementedError
 
 
-class PythonGen(CodeGenBase):
-    def gen(self, ast):
-        # собираем, потом добавим заголовок
-        for n in ast:
-            self.node(n)
-        body = "\n".join(self.lines)
-        header = (
-            "# Автоматически сгенерировано из схемы алгоритма\n"
-            "def main():\n"
-        )
-        body_ind = "\n".join("    " + l if l else "" for l in self.lines)
-        return header + (body_ind if body_ind.strip() else "    pass") + '\n\n\nif __name__ == "__main__":\n    main()\n'
+# ------------------------- PYTHON -------------------------
+class PythonGen(BaseGen):
+    def _render(self, ast):
+        # функции сверху
+        funcs = [n for n in ast if isinstance(n, FuncDef)]
+        main = [n for n in ast if not isinstance(n, FuncDef)]
 
-    def node(self, n: Node) -> None:
+        out = ["# Автоматически сгенерировано из схемы алгоритма", ""]
+
+        for f in funcs:
+            out.extend(self.render_func(f))
+            out.append("")
+
+        out.append("def main():")
+        old = self.lines
+        self.lines = []
+        self.indent = 1
+        for n in main:
+            self.node(n)
+        body = self.lines if self.lines else ["    pass"]
+        out.extend(body)
+        self.lines = old
+        out.append("")
+        out.append("")
+        out.append('if __name__ == "__main__":')
+        out.append("    main()")
+        return "\n".join(out)
+
+    def render_func(self, f: FuncDef):
+        params = ", ".join(p[0] for p in f.params)
+        self.lines = []
+        self.indent = 1
+        for n in f.body:
+            self.node(n)
+        body = self.lines if self.lines else ["    pass"]
+        header = f"def {f.name}({params}):"
+        return [header] + body
+
+    def node(self, n):
+        if isinstance(n, VarDecl):
+            if n.size > 0:
+                self.w(f"{n.names[0]} = [0] * {n.size}")
+            # скаляры в Python не объявляются
+            return
         if isinstance(n, Input):
             for name in n.names:
-                self.w(f'{name} = input("Введите {name}: ")')
-        elif isinstance(n, Assign):
-            self.w(f"{n.name} = {translate_expr(n.expr, 'python')}")
-        elif isinstance(n, Print):
+                t = self.type_of(name)
+                fn = PY_INPUT.get(t, "int")
+                self.w(f'{name} = {fn}(input("Введите {name}: "))')
+            return
+        if isinstance(n, Assign):
+            self.w(f"{n.target} = {translate_expr(n.expr, 'python')}")
+            return
+        if isinstance(n, Print):
             parts = []
             for e in n.exprs:
                 if is_string_literal(e):
@@ -371,7 +516,17 @@ class PythonGen(CodeGenBase):
                 else:
                     parts.append(f"str({translate_expr(e, 'python')})")
             self.w("print(" + ", ".join(parts) + ")")
-        elif isinstance(n, If):
+            return
+        if isinstance(n, Return):
+            if n.expr:
+                self.w(f"return {translate_expr(n.expr, 'python')}")
+            else:
+                self.w("return")
+            return
+        if isinstance(n, CallStmt):
+            self.w(translate_expr(n.call_expr, "python"))
+            return
+        if isinstance(n, If):
             self.w(f"if {translate_expr(n.cond, 'python')}:")
             self.indent += 1
             for x in n.then_body:
@@ -383,7 +538,8 @@ class PythonGen(CodeGenBase):
                 for x in n.else_body:
                     self.node(x)
                 self.indent -= 1
-        elif isinstance(n, For):
+            return
+        if isinstance(n, For):
             a = translate_expr(n.start, "python")
             b = translate_expr(n.end, "python")
             self.w(f"for {n.var} in range({a}, {b} + 1):")
@@ -391,112 +547,97 @@ class PythonGen(CodeGenBase):
             for x in n.body:
                 self.node(x)
             self.indent -= 1
-        elif isinstance(n, While):
+            return
+        if isinstance(n, While):
             self.w(f"while {translate_expr(n.cond, 'python')}:")
             self.indent += 1
             for x in n.body:
                 self.node(x)
             self.indent -= 1
+            return
 
 
-class JavaGen(CodeGenBase):
-    def gen(self, ast):
-        # тело main
-        body_lines: list[str] = []
-        old = self.lines
-        self.lines = body_lines
-        for n in ast:
-            self.node(n)
-        self.lines = old
+# ------------------------- C++ -------------------------
+class CppGen(BaseGen):
+    def _render(self, ast):
+        funcs = [n for n in ast if isinstance(n, FuncDef)]
+        main = [n for n in ast if not isinstance(n, FuncDef)]
 
-        inner = "\n".join("        " + l if l else "" for l in body_lines)
-        return (
-            "// Автоматически сгенерировано из схемы алгоритма\n"
-            "import java.util.Scanner;\n\n"
-            "public class Main {\n"
-            "    public static void main(String[] args) {\n"
-            "        Scanner sc = new Scanner(System.in);\n"
-            f"{inner}\n"
-            "        sc.close();\n"
-            "    }\n"
-            "}\n"
-        )
+        out = [
+            "// Автоматически сгенерировано из схемы алгоритма",
+            "#include <iostream>",
+            "#include <string>",
+            "using namespace std;",
+            "",
+        ]
 
-    def node(self, n: Node) -> None:
-        if isinstance(n, Input):
-            for name in n.names:
-                self.w(f'System.out.print("Введите {name}: ");')
-                self.w(f'{name} = sc.nextLine();')  # как строка; можно поправить под тип
-        elif isinstance(n, Assign):
-            self.w(f"{n.name} = {translate_expr(n.expr, 'java')};")
-        elif isinstance(n, Print):
-            parts = []
-            for e in n.exprs:
-                if is_string_literal(e):
-                    parts.append(e)
-                else:
-                    parts.append(f"{translate_expr(e, 'java')}")
-            self.w("System.out.println(" + " + \" \" + ".join(parts) + ");")
-        elif isinstance(n, If):
-            self.w(f"if ({translate_expr(n.cond, 'java')}) {{")
-            self.indent += 1
-            for x in n.then_body:
-                self.node(x)
-            self.indent -= 1
-            if n.else_body:
-                self.w("} else {")
-                self.indent += 1
-                for x in n.else_body:
-                    self.node(x)
-                self.indent -= 1
-            self.w("}")
-        elif isinstance(n, For):
-            a = translate_expr(n.start, "java")
-            b = translate_expr(n.end, "java")
-            self.w(f"for (int {n.var} = {a}; {n.var} <= {b}; {n.var}++) {{")
-            self.indent += 1
-            for x in n.body:
-                self.node(x)
-            self.indent -= 1
-            self.w("}")
-        elif isinstance(n, While):
-            self.w(f"while ({translate_expr(n.cond, 'java')}) {{")
-            self.indent += 1
-            for x in n.body:
-                self.node(x)
-            self.indent -= 1
-            self.w("}")
+        # прототипы функций
+        for f in funcs:
+            params = ", ".join(f"{CPP_TYPES.get(p[1], 'int')} {p[0]}" for p in f.params)
+            ret = "void" if f.ret_type == "VOID" else CPP_TYPES.get(f.ret_type, "int")
+            out.append(f"{ret} {f.name}({params});")
+        if funcs:
+            out.append("")
 
+        # тела функций
+        for f in funcs:
+            params = ", ".join(f"{CPP_TYPES.get(p[1], 'int')} {p[0]}" for p in f.params)
+            ret = "void" if f.ret_type == "VOID" else CPP_TYPES.get(f.ret_type, "int")
+            out.append(f"{ret} {f.name}({params}) {{")
+            # локальные VAR внутри функции
+            local_decls = []
+            for n in f.body:
+                if isinstance(n, VarDecl):
+                    for name in n.names:
+                        if n.size > 0:
+                            local_decls.append(
+                                f"    {CPP_TYPES.get(n.vtype, 'int')} {name}[{n.size}];"
+                            )
+                        else:
+                            local_decls.append(
+                                f"    {CPP_TYPES.get(n.vtype, 'int')} {name};"
+                            )
+            out.extend(local_decls)
+            self.lines = []
+            self.indent = 1
+            for n in f.body:
+                if not isinstance(n, VarDecl):
+                    self.node(n)
+            out.extend(self.lines)
+            out.append("}")
+            out.append("")
 
-class CppGen(CodeGenBase):
-    def gen(self, ast):
-        body_lines: list[str] = []
-        old = self.lines
-        self.lines = body_lines
-        for n in ast:
-            self.node(n)
-        self.lines = old
+        # main
+        out.append("int main() {")
+        for n in main:
+            if isinstance(n, VarDecl):
+                for name in n.names:
+                    if n.size > 0:
+                        out.append(f"    {CPP_TYPES.get(n.vtype, 'int')} {name}[{n.size}];")
+                    else:
+                        out.append(f"    {CPP_TYPES.get(n.vtype, 'int')} {name};")
+        self.lines = []
+        self.indent = 1
+        for n in main:
+            if not isinstance(n, VarDecl):
+                self.node(n)
+        out.extend(self.lines)
+        out.append("    return 0;")
+        out.append("}")
+        return "\n".join(out)
 
-        inner = "\n".join("    " + l if l else "" for l in body_lines)
-        return (
-            "// Автоматически сгенерировано из схемы алгоритма\n"
-            "#include <iostream>\n"
-            "#include <string>\n"
-            "using namespace std;\n\n"
-            "int main() {\n"
-            f"{inner}\n"
-            "    return 0;\n"
-            "}\n"
-        )
-
-    def node(self, n: Node) -> None:
+    def node(self, n):
+        if isinstance(n, VarDecl):
+            return
         if isinstance(n, Input):
             for name in n.names:
                 self.w(f'cout << "Введите {name}: ";')
                 self.w(f"cin >> {name};")
-        elif isinstance(n, Assign):
-            self.w(f"{n.name} = {translate_expr(n.expr, 'cpp')};")
-        elif isinstance(n, Print):
+            return
+        if isinstance(n, Assign):
+            self.w(f"{n.target} = {translate_expr(n.expr, 'cpp')};")
+            return
+        if isinstance(n, Print):
             parts = []
             for e in n.exprs:
                 if is_string_literal(e):
@@ -504,7 +645,17 @@ class CppGen(CodeGenBase):
                 else:
                     parts.append(translate_expr(e, "cpp"))
             self.w("cout << " + " << \" \" << ".join(parts) + " << endl;")
-        elif isinstance(n, If):
+            return
+        if isinstance(n, Return):
+            if n.expr:
+                self.w(f"return {translate_expr(n.expr, 'cpp')};")
+            else:
+                self.w("return;")
+            return
+        if isinstance(n, CallStmt):
+            self.w(translate_expr(n.call_expr, "cpp") + ";")
+            return
+        if isinstance(n, If):
             self.w(f"if ({translate_expr(n.cond, 'cpp')}) {{")
             self.indent += 1
             for x in n.then_body:
@@ -517,7 +668,8 @@ class CppGen(CodeGenBase):
                     self.node(x)
                 self.indent -= 1
             self.w("}")
-        elif isinstance(n, For):
+            return
+        if isinstance(n, For):
             a = translate_expr(n.start, "cpp")
             b = translate_expr(n.end, "cpp")
             self.w(f"for (int {n.var} = {a}; {n.var} <= {b}; {n.var}++) {{")
@@ -526,38 +678,233 @@ class CppGen(CodeGenBase):
                 self.node(x)
             self.indent -= 1
             self.w("}")
-        elif isinstance(n, While):
+            return
+        if isinstance(n, While):
             self.w(f"while ({translate_expr(n.cond, 'cpp')}) {{")
             self.indent += 1
             for x in n.body:
                 self.node(x)
             self.indent -= 1
             self.w("}")
+            return
 
 
-class VbGen(CodeGenBase):
-    def gen(self, ast):
-        self.w("' Автоматически сгенерировано из схемы алгоритма")
-        self.w("Module Program")
-        self.indent += 1
-        self.w("Sub Main()")
-        self.indent += 1
-        for n in ast:
-            self.node(n)
-        self.indent -= 1
-        self.w("End Sub")
-        self.indent -= 1
-        self.w("End Module")
-        return "\n".join(self.lines)
+# ------------------------- JAVA -------------------------
+class JavaGen(BaseGen):
+    def _render(self, ast):
+        funcs = [n for n in ast if isinstance(n, FuncDef)]
+        main = [n for n in ast if not isinstance(n, FuncDef)]
 
-    def node(self, n: Node) -> None:
+        out = [
+            "// Автоматически сгенерировано из схемы алгоритма",
+            "import java.util.Scanner;",
+            "",
+            "public class Main {",
+        ]
+
+        # static функции
+        for f in funcs:
+            params = ", ".join(f"{JAVA_TYPES.get(p[1], 'int')} {p[0]}" for p in f.params)
+            ret = "void" if f.ret_type == "VOID" else JAVA_TYPES.get(f.ret_type, "int")
+            out.append(f"    static {ret} {f.name}({params}) {{")
+            for n in f.body:
+                if isinstance(n, VarDecl):
+                    for name in n.names:
+                        if n.size > 0:
+                            out.append(
+                                f"        {JAVA_TYPES.get(n.vtype, 'int')}[] {name} = "
+                                f"new {JAVA_TYPES.get(n.vtype, 'int')}[{n.size}];"
+                            )
+                        else:
+                            out.append(f"        {JAVA_TYPES.get(n.vtype, 'int')} {name};")
+            self.lines = []
+            self.indent = 2
+            for n in f.body:
+                if not isinstance(n, VarDecl):
+                    self.node(n)
+            out.extend(self.lines)
+            out.append("    }")
+            out.append("")
+
+        # main
+        out.append("    public static void main(String[] args) {")
+        out.append("        Scanner sc = new Scanner(System.in);")
+        for n in main:
+            if isinstance(n, VarDecl):
+                for name in n.names:
+                    if n.size > 0:
+                        out.append(
+                            f"        {JAVA_TYPES.get(n.vtype, 'int')}[] {name} = "
+                            f"new {JAVA_TYPES.get(n.vtype, 'int')}[{n.size}];"
+                        )
+                    else:
+                        out.append(f"        {JAVA_TYPES.get(n.vtype, 'int')} {name};")
+        self.lines = []
+        self.indent = 2
+        for n in main:
+            if not isinstance(n, VarDecl):
+                self.node(n)
+        out.extend(self.lines)
+        out.append("        sc.close();")
+        out.append("    }")
+        out.append("}")
+        return "\n".join(out)
+
+    def node(self, n):
+        if isinstance(n, VarDecl):
+            return
         if isinstance(n, Input):
             for name in n.names:
+                t = self.type_of(name)
+                self.w(f'System.out.print("Введите {name}: ");')
+                if t == "INT":
+                    self.w(f"{name} = sc.nextInt();")
+                elif t == "FLOAT":
+                    self.w(f"{name} = sc.nextDouble();")
+                elif t == "BOOL":
+                    self.w(f"{name} = sc.nextBoolean();")
+                else:
+                    self.w(f"{name} = sc.next();")
+            return
+        if isinstance(n, Assign):
+            self.w(f"{n.target} = {translate_expr(n.expr, 'java')};")
+            return
+        if isinstance(n, Print):
+            parts = []
+            for e in n.exprs:
+                if is_string_literal(e):
+                    parts.append(e)
+                else:
+                    parts.append(translate_expr(e, "java"))
+            self.w("System.out.println(" + " + \" \" + ".join(parts) + ");")
+            return
+        if isinstance(n, Return):
+            if n.expr:
+                self.w(f"return {translate_expr(n.expr, 'java')};")
+            else:
+                self.w("return;")
+            return
+        if isinstance(n, CallStmt):
+            self.w(translate_expr(n.call_expr, "java") + ";")
+            return
+        if isinstance(n, If):
+            self.w(f"if ({translate_expr(n.cond, 'java')}) {{")
+            self.indent += 1
+            for x in n.then_body:
+                self.node(x)
+            self.indent -= 1
+            if n.else_body:
+                self.w("} else {")
+                self.indent += 1
+                for x in n.else_body:
+                    self.node(x)
+                self.indent -= 1
+            self.w("}")
+            return
+        if isinstance(n, For):
+            a = translate_expr(n.start, "java")
+            b = translate_expr(n.end, "java")
+            self.w(f"for (int {n.var} = {a}; {n.var} <= {b}; {n.var}++) {{")
+            self.indent += 1
+            for x in n.body:
+                self.node(x)
+            self.indent -= 1
+            self.w("}")
+            return
+        if isinstance(n, While):
+            self.w(f"while ({translate_expr(n.cond, 'java')}) {{")
+            self.indent += 1
+            for x in n.body:
+                self.node(x)
+            self.indent -= 1
+            self.w("}")
+            return
+
+
+# ------------------------- VISUAL BASIC -------------------------
+class VbGen(BaseGen):
+    def _render(self, ast):
+        funcs = [n for n in ast if isinstance(n, FuncDef)]
+        main = [n for n in ast if not isinstance(n, FuncDef)]
+
+        out = [
+            "' Автоматически сгенерировано из схемы алгоритма",
+            "Imports System",
+            "",
+            "Module Program",
+        ]
+
+        # функции
+        for f in funcs:
+            params = ", ".join(
+                f"ByVal {p[0]} As {VB_TYPES.get(p[1], 'Integer')}" for p in f.params
+            )
+            ret = "" if f.ret_type == "VOID" else f" As {VB_TYPES.get(f.ret_type, 'Integer')}"
+            out.append(f"    Function {f.name}({params}){ret}")
+            for n in f.body:
+                if isinstance(n, VarDecl):
+                    for name in n.names:
+                        if n.size > 0:
+                            out.append(
+                                f"        Dim {name}({n.size - 1}) As "
+                                f"{VB_TYPES.get(n.vtype, 'Integer')}"
+                            )
+                        else:
+                            out.append(
+                                f"        Dim {name} As {VB_TYPES.get(n.vtype, 'Integer')}"
+                            )
+            self.lines = []
+            self.indent = 2
+            for n in f.body:
+                if not isinstance(n, VarDecl):
+                    self.node(n)
+            out.extend(self.lines)
+            out.append("    End Function")
+            out.append("")
+
+        out.append("    Sub Main()")
+        for n in main:
+            if isinstance(n, VarDecl):
+                for name in n.names:
+                    if n.size > 0:
+                        out.append(
+                            f"        Dim {name}({n.size - 1}) As "
+                            f"{VB_TYPES.get(n.vtype, 'Integer')}"
+                        )
+                    else:
+                        out.append(
+                            f"        Dim {name} As {VB_TYPES.get(n.vtype, 'Integer')}"
+                        )
+        self.lines = []
+        self.indent = 2
+        for n in main:
+            if not isinstance(n, VarDecl):
+                self.node(n)
+        out.extend(self.lines)
+        out.append("    End Sub")
+        out.append("End Module")
+        return "\n".join(out)
+
+    def node(self, n):
+        if isinstance(n, VarDecl):
+            return
+        if isinstance(n, Input):
+            for name in n.names:
+                t = self.type_of(name)
                 self.w(f'Console.Write("Введите {name}: ")')
-                self.w(f"{name} = Console.ReadLine()")
-        elif isinstance(n, Assign):
-            self.w(f"{n.name} = {translate_expr(n.expr, 'vb')}")
-        elif isinstance(n, Print):
+                if t == "INT":
+                    self.w(f"{name} = Integer.Parse(Console.ReadLine())")
+                elif t == "FLOAT":
+                    self.w(f"{name} = Double.Parse(Console.ReadLine())")
+                elif t == "BOOL":
+                    self.w(f"{name} = Boolean.Parse(Console.ReadLine())")
+                else:
+                    self.w(f"{name} = Console.ReadLine()")
+            return
+        if isinstance(n, Assign):
+            self.w(f"{n.target} = {translate_expr(n.expr, 'vb')}")
+            return
+        if isinstance(n, Print):
             parts = []
             for e in n.exprs:
                 if is_string_literal(e):
@@ -565,202 +912,17 @@ class VbGen(CodeGenBase):
                 else:
                     parts.append(f"CStr({translate_expr(e, 'vb')})")
             self.w("Console.WriteLine(" + " & \" \" & ".join(parts) + ")")
-        elif isinstance(n, If):
+            return
+        if isinstance(n, Return):
+            if n.expr:
+                self.w(f"Return {translate_expr(n.expr, 'vb')}")
+            else:
+                self.w("Return")
+            return
+        if isinstance(n, CallStmt):
+            self.w(translate_expr(n.call_expr, "vb"))
+            return
+        if isinstance(n, If):
             self.w(f"If {translate_expr(n.cond, 'vb')} Then")
             self.indent += 1
-            for x in n.then_body:
-                self.node(x)
-            self.indent -= 1
-            if n.else_body:
-                self.w("Else")
-                self.indent += 1
-                for x in n.else_body:
-                    self.node(x)
-                self.indent -= 1
-            self.w("End If")
-        elif isinstance(n, For):
-            a = translate_expr(n.start, "vb")
-            b = translate_expr(n.end, "vb")
-            self.w(f"For {n.var} = {a} To {b}")
-            self.indent += 1
-            for x in n.body:
-                self.node(x)
-            self.indent -= 1
-            self.w("Next")
-        elif isinstance(n, While):
-            self.w(f"While {translate_expr(n.cond, 'vb')}")
-            self.indent += 1
-            for x in n.body:
-                self.node(x)
-            self.indent -= 1
-            self.w("End While")
-
-
-GENERATORS = {
-    "python": PythonGen,
-    "java": JavaGen,
-    "cpp": CppGen,
-    "vb": VbGen,
-}
-
-
-def generate_code(scheme: str, lang: str) -> str:
-    ast = parse_scheme(scheme)
-    return GENERATORS[lang]().gen(ast)
-
-
-# ============================================================
-#                       4. БОТ
-# ============================================================
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-user_lang: dict[int, str] = {}
-
-
-def is_allowed(uid: int) -> bool:
-    return uid in ALLOWED
-
-
-def langs_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(text=d["title"], callback_data=d["callback"])]
-        for d in LANGS.values()
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-@dp.my_chat_member()
-async def on_added_to_chat(event: ChatMemberUpdated):
-    if event.chat.type in ("group", "supergroup", "channel") and event.new_chat_member.status in (
-        "member", "administrator"
-    ):
-        try:
-            await bot.send_message(event.chat.id, MSG["left_chat"])
-        except TelegramBadRequest:
-            pass
-        try:
-            await bot.leave_chat(event.chat.id)
-            logging.info("Покинул чат %s", event.chat.id)
-        except TelegramBadRequest:
-            logging.exception("Не смог выйти из %s", event.chat.id)
-
-
-@dp.message(Command("id"))
-async def cmd_id(m: Message):
-    await m.answer(f"Твой ID: <code>{m.from_user.id}</code>")
-
-
-@dp.message(Command("add"))
-async def cmd_add(m: Message, c: CommandObject):
-    if m.from_user.id != OWNER_ID:
-        await m.answer(MSG["only_owner"]); return
-    arg = (c.args or "").strip()
-    if not arg.lstrip("-").isdigit():
-        await m.answer(MSG["add_usage"]); return
-    uid = int(arg)
-    ALLOWED.add(uid); save_allowed(ALLOWED)
-    await m.answer(MSG["added"].format(user_id=uid))
-
-
-@dp.message(Command("remove"))
-async def cmd_remove(m: Message, c: CommandObject):
-    if m.from_user.id != OWNER_ID:
-        await m.answer(MSG["only_owner"]); return
-    arg = (c.args or "").strip()
-    if not arg.lstrip("-").isdigit():
-        await m.answer("Использование: <code>/remove 123456789</code>"); return
-    uid = int(arg)
-    if uid == OWNER_ID:
-        await m.answer("Нельзя удалить владельца."); return
-    ALLOWED.discard(uid); save_allowed(ALLOWED)
-    await m.answer(MSG["removed"].format(user_id=uid))
-
-
-@dp.message(Command("list"))
-async def cmd_list(m: Message):
-    if m.from_user.id != OWNER_ID:
-        await m.answer(MSG["only_owner"]); return
-    others = sorted(ALLOWED - {OWNER_ID})
-    if not others:
-        await m.answer(MSG["empty_list"]); return
-    await m.answer(MSG["list"].format(users="\n".join(f"• <code>{u}</code>" for u in others)))
-
-
-@dp.message(Command("start"))
-async def cmd_start(m: Message):
-    if not is_allowed(m.from_user.id):
-        await m.answer(MSG["no_access"]); return
-    user_lang.pop(m.from_user.id, None)
-    await m.answer(MSG["start"], reply_markup=langs_keyboard())
-
-
-@dp.message(Command("cancel"))
-async def cmd_cancel(m: Message):
-    if not is_allowed(m.from_user.id):
-        await m.answer(MSG["no_access"]); return
-    user_lang.pop(m.from_user.id, None)
-    await m.answer("Отменено. /start — начать заново.")
-
-
-@dp.callback_query(F.data.startswith("lang_"))
-async def on_lang(call: CallbackQuery):
-    if not is_allowed(call.from_user.id):
-        await call.answer(MSG["no_access"], show_alert=True); return
-    for key, d in LANGS.items():
-        if d["callback"] == call.data:
-            user_lang[call.from_user.id] = key
-            await call.message.edit_text(
-                f"✅ Выбран язык: <b>{d['title']}</b>\n\n{MSG['ask_scheme']}"
-            )
-            await call.answer(); return
-    await call.answer("Неизвестный язык", show_alert=True)
-
-
-@dp.message(F.text)
-async def on_scheme(m: Message):
-    if not is_allowed(m.from_user.id):
-        await m.answer(MSG["no_access"]); return
-    lang = user_lang.get(m.from_user.id)
-    if not lang:
-        await m.answer(MSG["no_lang"], reply_markup=langs_keyboard()); return
-
-    try:
-        code = generate_code(m.text, lang)
-    except ParseError as e:
-        await m.answer(MSG["parse_error"].format(line=e.line, err=e.msg))
-        return
-    except Exception as e:
-        logging.exception("Ошибка генерации")
-        await m.answer(f"❌ Ошибка: {e}")
-        return
-
-    lang_title = LANGS[lang]["title"]
-    header = f"✅ Код на <b>{lang_title}</b>:\n"
-    # telegram имеет лимит 4096 — режем
-    for chunk in split_message(header + "\n<pre>" + escape_html(code) + "</pre>"):
-        await m.answer(chunk)
-
-
-def escape_html(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def split_message(text: str, limit: int = 4000):
-    parts, cur = [], ""
-    for line in text.splitlines(keepends=True):
-        if len(cur) + len(line) > limit:
-            parts.append(cur); cur = line
-        else:
-            cur += line
-    if cur:
-        parts.append(cur)
-    return parts
-
-
-async def main():
-    logging.info("🤖 Бот запущен. Владелец: %s", OWNER_ID)
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            for
