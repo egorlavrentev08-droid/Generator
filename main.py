@@ -66,7 +66,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # ============================================================
 #                  ТИПЫ ПЕРЕМЕННЫХ (маппинг)
 # ============================================================
-# Внутренние типы: INT, FLOAT, STR, BOOL
 PY_TYPES = {"INT": "int", "FLOAT": "float", "STR": "str", "BOOL": "bool"}
 CPP_TYPES = {"INT": "int", "FLOAT": "double", "STR": "string", "BOOL": "bool"}
 JAVA_TYPES = {"INT": "int", "FLOAT": "double", "STR": "String", "BOOL": "boolean"}
@@ -85,8 +84,8 @@ class Node:
 @dataclass
 class VarDecl(Node):
     names: list
-    vtype: str  # INT/FLOAT/STR/BOOL
-    size: int = 0  # 0 = не массив
+    vtype: str
+    size: int = 0
 
 
 @dataclass
@@ -101,7 +100,7 @@ class Print(Node):
 
 @dataclass
 class Assign(Node):
-    target: str  # "x" или "a[i]"
+    target: str
     expr: str
 
 
@@ -129,8 +128,8 @@ class While(Node):
 @dataclass
 class FuncDef(Node):
     name: str
-    params: list  # [(name, type), ...]
-    ret_type: str  # INT/FLOAT/STR/BOOL/VOID
+    params: list
+    ret_type: str
     body: list = field(default_factory=list)
 
 
@@ -141,7 +140,6 @@ class Return(Node):
 
 @dataclass
 class CallStmt(Node):
-    """Вызов процедуры как отдельный оператор: MYPROC(x, y)"""
     call_expr: str
 
 
@@ -184,7 +182,6 @@ def parse_scheme(text: str):
     tokens = []
     for i, raw in enumerate(raw_lines, 1):
         line = raw.rstrip()
-        # отрезаем комментарий (вне строк)
         out, in_str = "", False
         j = 0
         while j < len(line):
@@ -256,24 +253,23 @@ def parse_scheme(text: str):
                 body.append(FuncDef(name, params, ret, body_f))
                 continue
 
-            # VAR x, y, z: INT   /  VAR a: ARRAY[10] OF INT
-            m = re.match(r"^VAR\s+(.+?)\s*:\s*(\w+)(?:\s*\[\s*(\d+)\s*\])?$",
+            # VAR a[10]: INT  — массив (проверяем первым, т.к. более специфично)
+            m = re.match(r"^VAR\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*:\s*(\w+)$",
                          line, re.IGNORECASE)
-            if m and not re.match(r"^VAR\s+.+:\s*\w+\s*\[\s*\d+\s*\]\s+OF\s+", line, re.IGNORECASE):
+            if m:
+                next_tok()
+                body.append(VarDecl([m.group(1)], m.group(3).upper(), int(m.group(2))))
+                continue
+
+            # VAR x, y, z: INT
+            m = re.match(r"^VAR\s+(.+?)\s*:\s*(\w+)$", line, re.IGNORECASE)
+            if m:
                 next_tok()
                 names = [x.strip() for x in split_top_level(m.group(1)) if x.strip()]
                 vtype = m.group(2).upper()
                 if vtype not in PY_TYPES:
                     raise ParseError(line_no, f"неизвестный тип: {vtype}")
                 body.append(VarDecl(names, vtype))
-                continue
-
-            # VAR a[10]: INT  — массив
-            m = re.match(r"^VAR\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*:\s*(\w+)$",
-                         line, re.IGNORECASE)
-            if m:
-                next_tok()
-                body.append(VarDecl([m.group(1)], m.group(3).upper(), int(m.group(2))))
                 continue
 
             # INPUT
@@ -343,12 +339,12 @@ def parse_scheme(text: str):
 
             # Присваивание: x = ...  / a[i] = ...
             m = re.match(r"^([A-Za-z_]\w*(?:\s*\[[^\]]+\])?)\s*=\s*(.+)$", line)
-            if m and not line.upper().startswith(("IF ", "WHILE ", "FOR ", "VAR ", "FUNCTION ", "RETURN")):
+            if m and not up.startswith(("IF ", "WHILE ", "FOR ", "VAR ", "FUNCTION ", "RETURN", "PRINT", "INPUT")):
                 next_tok()
                 body.append(Assign(m.group(1).replace(" ", ""), m.group(2).strip()))
                 continue
 
-            # Вызов функции/процедуры как оператор: MYPROC(x, y)
+            # Вызов процедуры: MYPROC(x, y)
             m = re.match(r"^([A-Za-z_]\w*)\s*\((.*)\)\s*$", line)
             if m:
                 next_tok()
@@ -376,15 +372,16 @@ def translate_expr(expr: str, lang: str) -> str:
 
     s = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', mask, s)
 
-    # логические операторы
     s = re.sub(r"\bAND\b", "__AND__", s, flags=re.IGNORECASE)
     s = re.sub(r"\bOR\b", "__OR__", s, flags=re.IGNORECASE)
     s = re.sub(r"\bNOT\b", "__NOT__", s, flags=re.IGNORECASE)
     s = re.sub(r"\bTRUE\b", "__TRUE__", s, flags=re.IGNORECASE)
     s = re.sub(r"\bFALSE\b", "__FALSE__", s, flags=re.IGNORECASE)
-    # TRUE/FALSE как литералы
     s = re.sub(r"\bMOD\b", "%", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bDIV\b", "//", s, flags=re.IGNORECASE) if lang == "python" else re.sub(r"\bDIV\b", "/", s, flags=re.IGNORECASE)
+    if lang == "python":
+        s = re.sub(r"\bDIV\b", "//", s, flags=re.IGNORECASE)
+    else:
+        s = re.sub(r"\bDIV\b", "/", s, flags=re.IGNORECASE)
 
     if lang == "python":
         s = s.replace("__AND__", "and").replace("__OR__", "or").replace("__NOT__", "not")
@@ -409,28 +406,27 @@ def is_string_literal(e: str) -> bool:
 
 
 # ============================================================
-#                 ГЕНЕРАТОРЫ КОДА (4 языка)
+#                 ГЕНЕРАТОРЫ КОДА
 # ============================================================
 class BaseGen:
     def __init__(self):
         self.lines = []
         self.indent = 0
-        # таблица типов переменных: {name: "INT"}  — из VAR
         self.vars = {}
-        # функции: {name: (params, ret_type)}
         self.funcs = {}
 
     def w(self, text=""):
         self.lines.append(("    " * self.indent) + text if text else "")
 
     def collect(self, ast):
-        """Собирает переменные и функции из AST (рекурсивно)."""
         for n in ast:
             if isinstance(n, VarDecl):
                 for name in n.names:
                     self.vars[name] = n.vtype
             elif isinstance(n, FuncDef):
                 self.funcs[n.name] = (n.params, n.ret_type)
+                for pname, ptype in n.params:
+                    self.vars.setdefault(pname, ptype)
                 self.collect(n.body)
             elif isinstance(n, If):
                 self.collect(n.then_body)
@@ -442,23 +438,16 @@ class BaseGen:
                 self.collect(n.body)
 
     def type_of(self, name):
-        return self.vars.get(name, "INT")  # по умолчанию int
+        return self.vars.get(name, "INT")
 
     def gen(self, ast):
         self.collect(ast)
         return self._render(ast)
 
-    def _render(self, ast):
-        raise NotImplementedError
-
-    def node(self, n):
-        raise NotImplementedError
-
 
 # ------------------------- PYTHON -------------------------
 class PythonGen(BaseGen):
     def _render(self, ast):
-        # функции сверху
         funcs = [n for n in ast if isinstance(n, FuncDef)]
         main = [n for n in ast if not isinstance(n, FuncDef)]
 
@@ -469,35 +458,33 @@ class PythonGen(BaseGen):
             out.append("")
 
         out.append("def main():")
-        old = self.lines
         self.lines = []
         self.indent = 1
         for n in main:
             self.node(n)
-        body = self.lines if self.lines else ["    pass"]
-        out.extend(body)
-        self.lines = old
+        if not self.lines:
+            self.lines = ["    pass"]
+        out.extend(self.lines)
         out.append("")
         out.append("")
         out.append('if __name__ == "__main__":')
         out.append("    main()")
         return "\n".join(out)
 
-    def render_func(self, f: FuncDef):
+    def render_func(self, f):
         params = ", ".join(p[0] for p in f.params)
         self.lines = []
         self.indent = 1
         for n in f.body:
             self.node(n)
-        body = self.lines if self.lines else ["    pass"]
-        header = f"def {f.name}({params}):"
-        return [header] + body
+        if not self.lines:
+            self.lines = ["    pass"]
+        return [f"def {f.name}({params}):"] + self.lines
 
     def node(self, n):
         if isinstance(n, VarDecl):
             if n.size > 0:
                 self.w(f"{n.names[0]} = [0] * {n.size}")
-            # скаляры в Python не объявляются
             return
         if isinstance(n, Input):
             for name in n.names:
@@ -571,7 +558,6 @@ class CppGen(BaseGen):
             "",
         ]
 
-        # прототипы функций
         for f in funcs:
             params = ", ".join(f"{CPP_TYPES.get(p[1], 'int')} {p[0]}" for p in f.params)
             ret = "void" if f.ret_type == "VOID" else CPP_TYPES.get(f.ret_type, "int")
@@ -579,25 +565,17 @@ class CppGen(BaseGen):
         if funcs:
             out.append("")
 
-        # тела функций
         for f in funcs:
             params = ", ".join(f"{CPP_TYPES.get(p[1], 'int')} {p[0]}" for p in f.params)
             ret = "void" if f.ret_type == "VOID" else CPP_TYPES.get(f.ret_type, "int")
             out.append(f"{ret} {f.name}({params}) {{")
-            # локальные VAR внутри функции
-            local_decls = []
             for n in f.body:
                 if isinstance(n, VarDecl):
                     for name in n.names:
                         if n.size > 0:
-                            local_decls.append(
-                                f"    {CPP_TYPES.get(n.vtype, 'int')} {name}[{n.size}];"
-                            )
+                            out.append(f"    {CPP_TYPES.get(n.vtype, 'int')} {name}[{n.size}];")
                         else:
-                            local_decls.append(
-                                f"    {CPP_TYPES.get(n.vtype, 'int')} {name};"
-                            )
-            out.extend(local_decls)
+                            out.append(f"    {CPP_TYPES.get(n.vtype, 'int')} {name};")
             self.lines = []
             self.indent = 1
             for n in f.body:
@@ -607,7 +585,6 @@ class CppGen(BaseGen):
             out.append("}")
             out.append("")
 
-        # main
         out.append("int main() {")
         for n in main:
             if isinstance(n, VarDecl):
@@ -702,7 +679,6 @@ class JavaGen(BaseGen):
             "public class Main {",
         ]
 
-        # static функции
         for f in funcs:
             params = ", ".join(f"{JAVA_TYPES.get(p[1], 'int')} {p[0]}" for p in f.params)
             ret = "void" if f.ret_type == "VOID" else JAVA_TYPES.get(f.ret_type, "int")
@@ -726,7 +702,6 @@ class JavaGen(BaseGen):
             out.append("    }")
             out.append("")
 
-        # main
         out.append("    public static void main(String[] args) {")
         out.append("        Scanner sc = new Scanner(System.in);")
         for n in main:
@@ -834,7 +809,6 @@ class VbGen(BaseGen):
             "Module Program",
         ]
 
-        # функции
         for f in funcs:
             params = ", ".join(
                 f"ByVal {p[0]} As {VB_TYPES.get(p[1], 'Integer')}" for p in f.params
@@ -925,4 +899,54 @@ class VbGen(BaseGen):
         if isinstance(n, If):
             self.w(f"If {translate_expr(n.cond, 'vb')} Then")
             self.indent += 1
-            for
+            for x in n.then_body:
+                self.node(x)
+            self.indent -= 1
+            if n.else_body:
+                self.w("Else")
+                self.indent += 1
+                for x in n.else_body:
+                    self.node(x)
+                self.indent -= 1
+            self.w("End If")
+            return
+        if isinstance(n, For):
+            a = translate_expr(n.start, "vb")
+            b = translate_expr(n.end, "vb")
+            self.w(f"For {n.var} = {a} To {b}")
+            self.indent += 1
+            for x in n.body:
+                self.node(x)
+            self.indent -= 1
+            self.w("Next")
+            return
+        if isinstance(n, While):
+            self.w(f"While {translate_expr(n.cond, 'vb')}")
+            self.indent += 1
+            for x in n.body:
+                self.node(x)
+            self.indent -= 1
+            self.w("End While")
+            return
+
+
+# ============================================================
+#                    ВЫБОР ГЕНЕРАТОРА
+# ============================================================
+GENERATORS = {
+    "python": PythonGen,
+    "java": JavaGen,
+    "cpp": CppGen,
+    "vb": VbGen,
+}
+
+
+def generate_code(scheme: str, lang: str) -> str:
+    ast = parse_scheme(scheme)
+    return GENERATORS[lang]().gen(ast)
+
+
+# ============================================================
+#                        БОТ
+# ============================================================
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML
