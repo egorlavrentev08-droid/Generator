@@ -1,0 +1,23 @@
+{
+  "languages": {
+    "python": { "title": "🐍 Python", "callback": "lang_python" },
+    "java":   { "title": "☕ Java",   "callback": "lang_java"   },
+    "cpp":    { "title": "⚙️ C++",    "callback": "lang_cpp"    },
+    "vb":     { "title": "🟦 Visual Basic", "callback": "lang_vb" }
+  },
+  "messages": {
+    "start": "👋 Привет! Я перевожу схему алгоритма в код на 4 языках.\n\nВыбери язык:",
+    "ask_scheme": "✍️ Отправь схему алгоритма в таком формате:\n\n<code>BEGIN\nINPUT a, b\nx = a + b\nIF x > 10 THEN\n  PRINT \"big\"\nELSE\n  PRINT \"small\"\nENDIF\nPRINT x\nEND</code>\n\nПоддерживается: INPUT, PRINT, присваивание, IF/ELSE/ENDIF, FOR/ENDFOR, WHILE/ENDWHILE, # комментарии.",
+    "generating": "⏳ Генерирую код на {lang}...",
+    "parse_error": "❌ Ошибка в схеме (строка {line}): {err}",
+    "no_lang": "Сначала выбери язык командой /start",
+    "no_access": "🚫 У тебя нет доступа к этому боту.",
+    "only_owner": "🚫 Только владелец может использовать эту команду.",
+    "added": "✅ Пользователь {user_id} добавлен.",
+    "removed": "🗑 Пользователь {user_id} удалён.",
+    "add_usage": "Использование: <code>/add 123456789</code>\n(Telegram не даёт искать по @username — попроси человека прислать тебе его ID через /id)",
+    "list": "👥 Разрешённые пользователи:\n{users}",
+    "empty_list": "Список пуст (доступ только у владельца).",
+    "left_chat": "🚪 Я не работаю в группах и каналах. Покидаю чат."
+  }
+}
