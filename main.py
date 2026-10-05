@@ -949,4 +949,154 @@ def generate_code(scheme: str, lang: str) -> str:
 # ============================================================
 #                        БОТ
 # ============================================================
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+user_lang: dict = {}
+
+
+def is_allowed(uid: int) -> bool:
+    return uid in ALLOWED
+
+
+def langs_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=d["title"], callback_data=d["callback"])]
+        for d in LANGS.values()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.my_chat_member()
+async def on_added_to_chat(event: ChatMemberUpdated):
+    if event.chat.type in ("group", "supergroup", "channel") and event.new_chat_member.status in (
+        "member", "administrator"
+    ):
+        try:
+            await bot.send_message(event.chat.id, MSG["left_chat"])
+        except TelegramBadRequest:
+            pass
+        try:
+            await bot.leave_chat(event.chat.id)
+            logging.info("Покинул чат %s", event.chat.id)
+        except TelegramBadRequest:
+            logging.exception("Не смог выйти из %s", event.chat.id)
+
+
+@dp.message(Command("id"))
+async def cmd_id(m: Message):
+    await m.answer(f"Твой ID: <code>{m.from_user.id}</code>")
+
+
+@dp.message(Command("add"))
+async def cmd_add(m: Message, c: CommandObject):
+    if m.from_user.id != OWNER_ID:
+        await m.answer(MSG["only_owner"]); return
+    arg = (c.args or "").strip()
+    if not arg.lstrip("-").isdigit():
+        await m.answer(MSG["add_usage"]); return
+    uid = int(arg)
+    ALLOWED.add(uid); save_allowed(ALLOWED)
+    await m.answer(MSG["added"].format(user_id=uid))
+
+
+@dp.message(Command("remove"))
+async def cmd_remove(m: Message, c: CommandObject):
+    if m.from_user.id != OWNER_ID:
+        await m.answer(MSG["only_owner"]); return
+    arg = (c.args or "").strip()
+    if not arg.lstrip("-").isdigit():
+        await m.answer("Использование: <code>/remove 123456789</code>"); return
+    uid = int(arg)
+    if uid == OWNER_ID:
+        await m.answer("Нельзя удалить владельца."); return
+    ALLOWED.discard(uid); save_allowed(ALLOWED)
+    await m.answer(MSG["removed"].format(user_id=uid))
+
+
+@dp.message(Command("list"))
+async def cmd_list(m: Message):
+    if m.from_user.id != OWNER_ID:
+        await m.answer(MSG["only_owner"]); return
+    others = sorted(ALLOWED - {OWNER_ID})
+    if not others:
+        await m.answer(MSG["empty_list"]); return
+    await m.answer(MSG["list"].format(users="\n".join(f"• <code>{u}</code>" for u in others)))
+
+
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    if not is_allowed(m.from_user.id):
+        await m.answer(MSG["no_access"]); return
+    user_lang.pop(m.from_user.id, None)
+    await m.answer(MSG["start"], reply_markup=langs_keyboard())
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(m: Message):
+    if not is_allowed(m.from_user.id):
+        await m.answer(MSG["no_access"]); return
+    user_lang.pop(m.from_user.id, None)
+    await m.answer("Отменено. /start — начать заново.")
+
+
+@dp.callback_query(F.data.startswith("lang_"))
+async def on_lang(call: CallbackQuery):
+    if not is_allowed(call.from_user.id):
+        await call.answer(MSG["no_access"], show_alert=True); return
+    for key, d in LANGS.items():
+        if d["callback"] == call.data:
+            user_lang[call.from_user.id] = key
+            await call.message.edit_text(
+                f"✅ Выбран язык: <b>{d['title']}</b>\n\n{MSG['ask_scheme']}"
+            )
+            await call.answer(); return
+    await call.answer("Неизвестный язык", show_alert=True)
+
+
+@dp.message(F.text)
+async def on_scheme(m: Message):
+    if not is_allowed(m.from_user.id):
+        await m.answer(MSG["no_access"]); return
+    lang = user_lang.get(m.from_user.id)
+    if not lang:
+        await m.answer(MSG["no_lang"], reply_markup=langs_keyboard()); return
+
+    try:
+        code = generate_code(m.text, lang)
+    except ParseError as e:
+        await m.answer(MSG["parse_error"].format(line=e.line, err=e.msg))
+        return
+    except Exception as e:
+        logging.exception("Ошибка генерации")
+        await m.answer(f"❌ Ошибка: {e}")
+        return
+
+    lang_title = LANGS[lang]["title"]
+    header = f"✅ Код на <b>{lang_title}</b>:\n"
+    for chunk in split_message(header + "\n<pre>" + escape_html(code) + "</pre>"):
+        await m.answer(chunk)
+
+
+def escape_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def split_message(text: str, limit: int = 4000):
+    parts, cur = [], ""
+    for line in text.splitlines(keepends=True):
+        if len(cur) + len(line) > limit:
+            parts.append(cur); cur = line
+        else:
+            cur += line
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+async def main():
+    logging.info("🤖 Бот запущен. Владелец: %s", OWNER_ID)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
